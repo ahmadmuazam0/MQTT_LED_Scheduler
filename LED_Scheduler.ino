@@ -234,10 +234,9 @@ void mqttHandeling(void* pvParameters){
 
 void blinkScheduling(void* pvParameter){
   uint8_t adress = 0;
-  Scheduler_t S;
   for (uint8_t i = 0; i < 5; i++)
   {
-    Schedule[i+1] = EEPROM.get(adress,S);
+    EEPROM.get(adress,Schedule[i+1]);
     adress = i*sizeof(Scheduler_t);
   }
 
