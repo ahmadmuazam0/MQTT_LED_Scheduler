@@ -1,36 +1,37 @@
+#include <RTClib.h>
 #include <PubSubClient.h>   // To handle the MQTT Client
 #include <WiFiManager.h>    // To Manage the WiFi 
 #include <ArduinoJson.h>    // To handle JSON Data
+#include <EEPROM.h>
+#include <FreeRTOS.h>
+
 
 #define DEBUG Serial
-#define LED1 22
+#define LED1 4
 #define LED2 5
+#define TimerIntrupt 12
 
 WiFiClient espClient;
 PubSubClient mqttclient(espClient);
-unsigned long previousMillis1 = millis();
-unsigned long previousMillis2 = millis();
-uint8_t l1rate =0,l2rate=0;
-const char* ssid = "GUEST";
-const char* password = "12341234";
+
+
+TaskHandle_t mqttTask;
+TaskHandle_t schedularTask;
+
+
+const char*     ssid        = "Epazz2FOffice4-2G";
+const char*     password    = "epazzlahore";
 const char*     MQTT_broker = "broker.hivemq.com";
-const uint16_t  MQTTport    = 1883;
-const char*     clientID    = "ESP32";
-const char*     Topic       = "ESP32/ledScheduler";
+const uint16_t  MQTTport    =  1883;
+const char*     clientID    = "KYTHERTEK123";
+const char*     Topic       = "KytherTek/ledScheduler";
 
 bool led1State, led2State;
 
-enum ScheduleID_t{
-  SCHEDULE_1 = 1,
-  SCHEDULE_2,
-  SCHEDULE_3,
-  SCHEDULE_4,
-  SCHEDULE_5
-};
 
-struct Scheduler {
+struct Scheduler_t {
 
-  ScheduleID_t id;
+  uint8_t id;
   uint8_t DayOfWeek;
   uint8_t startHour;
   uint8_t startMinute;
@@ -42,7 +43,7 @@ struct Scheduler {
 };
 
 
-Scheduler S1,S2,S3,S4,S5;
+Scheduler_t Schedule[5];
 
 /**
  * To setup the MQTT client and Broker Handshake
@@ -68,7 +69,6 @@ void mqttReconnect(){
       mqttclient.subscribe(Topic);
     } else DEBUG.print("Failed to connect, Retrying . . .");
   }
-  
 }
 
 /**
@@ -79,10 +79,10 @@ void mqttReconnect(){
  * @returns none
  */
 void callback(char* topic, byte* message, unsigned int length) {
-  
   char json[length+1];
   memcpy(json,message,length);
   json[length]='\0';
+
   DEBUG.println(json);
   // Parse the JSON payload
   StaticJsonDocument<256> doc;
@@ -93,19 +93,19 @@ void callback(char* topic, byte* message, unsigned int length) {
     return;
   }
 
-  Scheduler receivedSchedule;
+  Scheduler_t receivedSchedule;
   receivedSchedule.id           = doc["id"];
   receivedSchedule.DayOfWeek    = doc["dayOfWeek"];
   receivedSchedule.startHour    = doc["startHour"];
   receivedSchedule.startMinute  = doc["startMinute"];
   receivedSchedule.endHour      = doc["endHour"];
   receivedSchedule.endMinute    = doc["endMinute"];
-  l1rate    = doc["led1Rate"];
-  l2rate    = doc["led2Rate"];
+  receivedSchedule.led1Rate     = doc["led1Rate"];
+  receivedSchedule.led2Rate     = doc["led2Rate"];
   DEBUG.print("The ID of the Schedular is: ");
   DEBUG.println(receivedSchedule.id);
- // DEBUG.println("Start Time is %d : %d",receivedSchedule.startHour ,receivedSchedule.startMinute );
 
+  updateEEPROM(receivedSchedule);
 }
 
 /**
@@ -125,8 +125,28 @@ WiFi.mode(WIFI_STA);
 }
 
 
-void UpdateStatus(){
-  
+/**
+ * To initialize the EEPROM 
+ * @returns None
+ */
+void EEPROMInit(){
+  if(!EEPROM.begin(sizeof(Scheduler_t) * 5)){
+    DEBUG.printf("EEPROM Initialization Failed. Reboot system");
+  }
+}
+
+/**
+ * To Store and Update the Schedule in EEPROM
+ * @param sched: Taking Value of scheduler to store in EEPROM
+ * @returns None
+ */
+void updateEEPROM(Scheduler_t &sched){
+  if (sched.id > 0 && sched.id <= 5 )
+  {  
+  uint8_t address = sched.id * sizeof(Scheduler_t);
+  EEPROM.put(address,sched);
+  EEPROM.commit();
+  }else DEBUG.printf("Invalid ID");
 }
 
 /**
@@ -135,7 +155,7 @@ void UpdateStatus(){
  * @returns none
  */
 void BlinkLED1(uint8_t rate){
-  //unsigned long previousMillis1 = millis();
+  unsigned long previousMillis1 = millis();
   if(rate > 0) {
     if(millis() - previousMillis1 >= (1000/rate)) {
       previousMillis1 = millis();
@@ -147,13 +167,18 @@ void BlinkLED1(uint8_t rate){
     led1State = false;}
 }
 
+void readScheduleFromEEPROM(int id, Scheduler_t &sched) {
+  int addr = id * sizeof(Scheduler_t);
+  EEPROM.get(addr, sched);
+}
+
 /**
  * To set the Blinking Rate of LED 2 Per Second
  * @param rate: At which the LED 2 should Blink
  * @returns None
  */
 void BlinkLED2(uint8_t rate){
-  //unsigned long previousMillis2 = millis();
+  unsigned long previousMillis2 = millis();
   if(rate > 0) {
     if(millis() - previousMillis2 >= (1000/rate)) {
       previousMillis2 = millis();
@@ -171,26 +196,58 @@ void setup() {
   DEBUG.begin(115200);
   pinMode(LED1,OUTPUT);
   pinMode(LED2,OUTPUT);
-  digitalWrite(LED1,HIGH);
-  delay(1000);
-  digitalWrite(LED1,LOW);
-  digitalWrite(LED2,HIGH);
-  delay(1000);
-  digitalWrite(LED2,LOW);
-  wifiConnect();
-  mqttSetup();
+
+  xTaskCreatePinnedToCore(
+              mqttHandeling,
+              "MQTT",
+              1024,
+              NULL,
+              1,
+              &mqttTask,
+              0
+  );
+
+  xTaskCreatePinnedToCore(
+              blinkScheduling,
+              "MQTT",
+              1024,
+              NULL,
+              1,
+              &schedularTask,
+              1
+  );
 }
 
-void loop() {
-  // put your main code here, to run repeatedly:
-  BlinkLED1(l1rate);
-  BlinkLED2(l2rate);
-  if (!mqttclient.connected())
+
+void mqttHandeling(void* pvParameters){
+  EEPROMInit();
+  wifiConnect();
+  mqttSetup();
+  for(;;){
+    mqttclient.loop();
+    if (!mqttclient.connected())
+    {
+      mqttReconnect();
+    }
+  }
+}
+
+void blinkScheduling(void* pvParameter){
+  uint8_t adress = 0;
+  Scheduler_t S;
+  for (uint8_t i = 0; i < 5; i++)
   {
-    mqttReconnect();
+    Schedule[i+1] = EEPROM.get(adress,S);
+    adress = i*sizeof(Scheduler_t);
   }
 
-
-  mqttclient.loop();
+  for (;;)
+  {
+    /* code */
+  }
   
+  
+}
+void loop() {
+  // put your main code here, to run repeatedly:
 }
