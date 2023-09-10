@@ -5,19 +5,36 @@
 #include <EEPROM.h>
 #include <FreeRTOS.h>
 
-
 #define DEBUG Serial
 #define LED1 4
 #define LED2 5
-#define TimerIntrupt 12
+#define MAX_SCHEDULES 5
 
+RTC_DS3231 rtc;
 WiFiClient espClient;
 PubSubClient mqttclient(espClient);
 
+hw_timer_t *BlinkTimer = NULL;
+void IRAM_ATTR onTimerIntrupt(){
+
+  if (startBlinking)
+  {
+    startBlinking = false;
+    getSchedule = true;
+    
+  }else
+  {
+    startBlinking = true;
+    getSchedule = false;
+    timerAlarmWrite(BlinkTimer, stopAlam, false);
+    timerAlarmEnabled(BlinkTimer);
+  }
+  
+}
 
 TaskHandle_t mqttTask;
 TaskHandle_t schedularTask;
-
+DateTime nowClock = rtc.now();
 
 const char*     ssid        = "Epazz2FOffice4-2G";
 const char*     password    = "epazzlahore";
@@ -25,9 +42,9 @@ const char*     MQTT_broker = "broker.hivemq.com";
 const uint16_t  MQTTport    =  1883;
 const char*     clientID    = "KYTHERTEK123";
 const char*     Topic       = "KytherTek/ledScheduler";
+uint64_t startAlarm, stopAlam;
 
-bool led1State, led2State;
-
+bool startBlinking = false, getSchedule = false, led1State = false, led2State = false;
 
 struct Scheduler_t {
 
@@ -39,11 +56,12 @@ struct Scheduler_t {
   uint8_t endMinute;
   uint8_t led1Rate;
   uint8_t led2Rate;
+  bool    flag;
 
 };
 
-
 Scheduler_t Schedule[5];
+Scheduler_t curretnSchedule;
 
 /**
  * To setup the MQTT client and Broker Handshake
@@ -54,8 +72,6 @@ void mqttSetup()
   mqttclient.setServer(MQTT_broker,MQTTport);
   mqttclient.setCallback(callback);
 }
-
-
 
 /**
  * Incase of connection lost this will connect the client with broker
@@ -102,6 +118,7 @@ void callback(char* topic, byte* message, unsigned int length) {
   receivedSchedule.endMinute    = doc["endMinute"];
   receivedSchedule.led1Rate     = doc["led1Rate"];
   receivedSchedule.led2Rate     = doc["led2Rate"];
+  receivedSchedule.flag         = false;
   DEBUG.print("The ID of the Schedular is: ");
   DEBUG.println(receivedSchedule.id);
 
@@ -113,8 +130,6 @@ void callback(char* topic, byte* message, unsigned int length) {
  * 
  */
 void wifiConnect() {
-// wm.autoConnect("KytherTek_MQTT"); 
-// wm.setConnectTimeout(10);     // It'll try reconnecting for 10s
 
 WiFi.mode(WIFI_STA);
  WiFi.begin(ssid, password);
@@ -123,7 +138,6 @@ WiFi.mode(WIFI_STA);
    Serial.print(".");
  }
 }
-
 
 /**
  * To initialize the EEPROM 
@@ -190,13 +204,74 @@ void BlinkLED2(uint8_t rate){
     led2State = false;}
 }
 
+void getScheduleptr(void){
+
+  uint8_t adress = 0;
+  uint8_t smallestHour;
+  uint8_t smallestMinute;
+  uint8_t currentHour;
+  uint8_t currentMinute;
+
+
+  nowClock = rtc.now();
+
+  for (uint8_t i = 0; i < MAX_SCHEDULES; i++)
+  {
+    adress = i*sizeof(Scheduler_t);
+    EEPROM.get(adress,Schedule[i]);
+    if (Schedule[i].flag ==false && Schedule[i].startHour >= nowClock.hour() && Schedule[i].startMinute >= nowClock.minute())
+    {
+      currentHour    = Schedule[i].startHour - nowClock.hour();
+      currentMinute  = Schedule[i].startMinute - nowClock.minute();
+      if (currentHour <= smallestHour && currentMinute <= smallestMinute)
+      {
+        smallestHour = currentHour;
+        smallestMinute = currentMinute;
+        curretnSchedule = Schedule[i];
+      }     
+    }
+
+    nowClock = rtc.now();
+    
+
+  }
+  getSchedule = false;
+  
+}
+
+/**
+ * To set the Start and End Time of Schedule to trigger Timer Interrupt Accordingly
+ * @param Sched : Gets the Scheduler from which the Time has to get to set Alarms
+ * @returns NONE
+ */
+
+void getAlarmTime(Scheduler_t Sched){
+
+ uint8_t hours,minutes;
+ nowClock = rtc.now();
+ hours =  curretnSchedule.startHour -  nowClock.hour() * 60;
+ minutes = curretnSchedule.startMinute - nowClock.minute();
+ startAlarm = (hours + minutes) * 60 * 1000;
+
+ hours =  curretnSchedule.endHour -  nowClock.hour() * 60;
+ minutes = curretnSchedule.endMinute - nowClock.minute();
+ stopAlam = (hours + minutes) * 60 * 1000;
+
+ timerAlarmWrite(BlinkTimer,startAlarm,false);
+ timerAlarmEnable(BlinkTimer);
+
+}
+
 uint16_t mils=millis();
 
 void setup() {
+
   DEBUG.begin(115200);
   pinMode(LED1,OUTPUT);
   pinMode(LED2,OUTPUT);
-
+  if(rtc.lostPower())rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // Adjust the Date and time at Compiling
+  BlinkTimer = timerBegin(0,80000,true);   // 0: Timer 0,  80000: Prescaller,  true: Count Upwards 1000cycle = 1Second
+  timerAttachInterrupt(BlinkTimer,&onTimerIntrupt,false);
   xTaskCreatePinnedToCore(
               mqttHandeling,
               "MQTT",
@@ -209,13 +284,14 @@ void setup() {
 
   xTaskCreatePinnedToCore(
               blinkScheduling,
-              "MQTT",
+              "Blink",
               1024,
               NULL,
               1,
               &schedularTask,
               1
   );
+
 }
 
 
@@ -233,16 +309,16 @@ void mqttHandeling(void* pvParameters){
 }
 
 void blinkScheduling(void* pvParameter){
-  uint8_t adress = 0;
-  for (uint8_t i = 0; i < 5; i++)
-  {
-    EEPROM.get(adress,Schedule[i+1]);
-    adress = i*sizeof(Scheduler_t);
-  }
-
+  
   for (;;)
   {
-    /* code */
+    if(getSchedule)getScheduleptr();
+    while (startBlinking)
+    {
+      BlinkLED1(curretnSchedule.led1Rate);
+      BlinkLED2(curretnSchedule.led2Rate);
+    }
+    
   }
   
   
