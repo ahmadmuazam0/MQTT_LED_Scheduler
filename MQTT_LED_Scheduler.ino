@@ -1,9 +1,10 @@
 #include <RTClib.h>
 #include <PubSubClient.h>   // To handle the MQTT Client
-#include <WiFiManager.h>    // To Manage the WiFi 
+#include <WiFi.h>    // To Manage the WiFi 
 #include <ArduinoJson.h>    // To handle JSON Data
 #include <EEPROM.h>
-#include <FreeRTOS.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 #define DEBUG Serial
 #define LED1 4
@@ -14,26 +15,10 @@ RTC_DS3231 rtc;
 WiFiClient espClient;
 PubSubClient mqttclient(espClient);
 
-hw_timer_t *BlinkTimer = NULL;
-void IRAM_ATTR onTimerIntrupt(){
-
-  if (startBlinking)
-  {
-    startBlinking = false;
-    getSchedule = true;
-    
-  }else
-  {
-    startBlinking = true;
-    getSchedule = false;
-    timerAlarmWrite(BlinkTimer, stopAlam, false);
-    timerAlarmEnabled(BlinkTimer);
-  }
-  
-}
-
+QueueHandle_t xQueue;
 TaskHandle_t mqttTask;
 TaskHandle_t schedularTask;
+
 DateTime nowClock = rtc.now();
 
 const char*     ssid        = "Epazz2FOffice4-2G";
@@ -42,6 +27,7 @@ const char*     MQTT_broker = "broker.hivemq.com";
 const uint16_t  MQTTport    =  1883;
 const char*     clientID    = "KYTHERTEK123";
 const char*     Topic       = "KytherTek/ledScheduler";
+const char*     txTopic     = "KytherTek/sendScheduler";
 uint64_t startAlarm, stopAlam;
 
 bool startBlinking = false, getSchedule = false, led1State = false, led2State = false;
@@ -123,6 +109,7 @@ void callback(char* topic, byte* message, unsigned int length) {
   DEBUG.println(receivedSchedule.id);
 
   updateEEPROM(receivedSchedule);
+  // readScheduleFromEEPROM();
 }
 
 /**
@@ -157,7 +144,7 @@ void EEPROMInit(){
 void updateEEPROM(Scheduler_t &sched){
   if (sched.id > 0 && sched.id <= 5 )
   {  
-  uint8_t address = sched.id * sizeof(Scheduler_t);
+  uint8_t address = (sched.id-1) * sizeof(Scheduler_t);
   EEPROM.put(address,sched);
   EEPROM.commit();
   }else DEBUG.printf("Invalid ID");
@@ -181,9 +168,14 @@ void BlinkLED1(uint8_t rate){
     led1State = false;}
 }
 
-void readScheduleFromEEPROM(int id, Scheduler_t &sched) {
-  int addr = id * sizeof(Scheduler_t);
-  EEPROM.get(addr, sched);
+void readScheduleFromEEPROM() {
+  int addr = 0;
+  for (uint8_t i = 0; i < MAX_SCHEDULES; i++)
+  {
+    addr = i * sizeof(Scheduler_t);;
+    EEPROM.get(addr, Schedule[i]);
+  }
+ 
 }
 
 /**
@@ -204,78 +196,21 @@ void BlinkLED2(uint8_t rate){
     led2State = false;}
 }
 
-void getScheduleptr(void){
-
-  uint8_t adress = 0;
-  uint8_t smallestHour;
-  uint8_t smallestMinute;
-  uint8_t currentHour;
-  uint8_t currentMinute;
-
-
-  nowClock = rtc.now();
-
-  for (uint8_t i = 0; i < MAX_SCHEDULES; i++)
-  {
-    adress = i*sizeof(Scheduler_t);
-    EEPROM.get(adress,Schedule[i]);
-    if (Schedule[i].flag ==false && Schedule[i].startHour >= nowClock.hour() && Schedule[i].startMinute >= nowClock.minute())
-    {
-      currentHour    = Schedule[i].startHour - nowClock.hour();
-      currentMinute  = Schedule[i].startMinute - nowClock.minute();
-      if (currentHour <= smallestHour && currentMinute <= smallestMinute)
-      {
-        smallestHour = currentHour;
-        smallestMinute = currentMinute;
-        curretnSchedule = Schedule[i];
-      }     
-    }
-
-    nowClock = rtc.now();
-    
-
-  }
-  getSchedule = false;
-  
-}
-
-/**
- * To set the Start and End Time of Schedule to trigger Timer Interrupt Accordingly
- * @param Sched : Gets the Scheduler from which the Time has to get to set Alarms
- * @returns NONE
- */
-
-void getAlarmTime(Scheduler_t Sched){
-
- uint8_t hours,minutes;
- nowClock = rtc.now();
- hours =  curretnSchedule.startHour -  nowClock.hour() * 60;
- minutes = curretnSchedule.startMinute - nowClock.minute();
- startAlarm = (hours + minutes) * 60 * 1000;
-
- hours =  curretnSchedule.endHour -  nowClock.hour() * 60;
- minutes = curretnSchedule.endMinute - nowClock.minute();
- stopAlam = (hours + minutes) * 60 * 1000;
-
- timerAlarmWrite(BlinkTimer,startAlarm,false);
- timerAlarmEnable(BlinkTimer);
-
-}
-
 uint16_t mils=millis();
 
 void setup() {
-
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable   detector
   DEBUG.begin(115200);
   pinMode(LED1,OUTPUT);
   pinMode(LED2,OUTPUT);
   if(rtc.lostPower())rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));  // Adjust the Date and time at Compiling
-  BlinkTimer = timerBegin(0,80000,true);   // 0: Timer 0,  80000: Prescaller,  true: Count Upwards 1000cycle = 1Second
-  timerAttachInterrupt(BlinkTimer,&onTimerIntrupt,false);
+  xQueue = xQueueCreate(1,sizeof(String));
+  while (xQueue == NULL);
+  
   xTaskCreatePinnedToCore(
               mqttHandeling,
               "MQTT",
-              1024,
+              2048,
               NULL,
               1,
               &mqttTask,
@@ -285,7 +220,7 @@ void setup() {
   xTaskCreatePinnedToCore(
               blinkScheduling,
               "Blink",
-              1024,
+              2048,
               NULL,
               1,
               &schedularTask,
@@ -294,33 +229,76 @@ void setup() {
 
 }
 
+void sendCurrentStatus(Scheduler_t &Sched)
+{
+  String data;
+  data += "Current Schedule ID: ";
+  data += Sched.id;
+  data += " Led 1 rate : ";
+  data += Sched.led1Rate;
+  data += " Led 2 rate : ";
+  data += Sched.led2Rate;
+  xQueueSend(xQueue,&data,portMAX_DELAY);
+}
 
 void mqttHandeling(void* pvParameters){
   EEPROMInit();
   wifiConnect();
   mqttSetup();
+  String rxData;
   for(;;){
     mqttclient.loop();
     if (!mqttclient.connected())
     {
       mqttReconnect();
     }
+    mqttclient.subscribe(Topic);
   }
+
+  xQueueReceive(xQueue,&rxData,portMAX_DELAY);
+  mqttclient.publish(txTopic,rxData.c_str(),sizeof(rxData));
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 void blinkScheduling(void* pvParameter){
   
   for (;;)
   {
-    if(getSchedule)getScheduleptr();
+    while(getSchedule)
+    {
+      readScheduleFromEEPROM();
+      uint8_t i=0;
+      nowClock = rtc.now();
+      if (Schedule[i].DayOfWeek == nowClock.day())
+      {
+        if (Schedule[i].startHour == nowClock.hour() && Schedule[i].startMinute == nowClock.minute())
+        {
+          startBlinking = true;
+          Schedule[i].flag = true;
+          curretnSchedule = Schedule[i];
+          getSchedule = false;
+          sendCurrentStatus(curretnSchedule);
+          break;
+        }               
+      }
+      nowClock = rtc.now();
+      i++ > 5 ? i=0:i;
+      
+    }
     while (startBlinking)
     {
+      nowClock = rtc.now();
+      if (curretnSchedule.endHour == nowClock.hour() && curretnSchedule.endMinute == nowClock.minute())
+        {
+          startBlinking = false;
+          getSchedule = true;
+          curretnSchedule.flag = false;
+        }
       BlinkLED1(curretnSchedule.led1Rate);
       BlinkLED2(curretnSchedule.led2Rate);
     }
     
   }
-  
   
 }
 void loop() {
