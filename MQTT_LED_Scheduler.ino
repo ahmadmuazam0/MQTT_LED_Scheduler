@@ -1,3 +1,6 @@
+/**
+ * See README.md for setup of Broker connections
+*/
 #include <RTClib.h>
 #include <PubSubClient.h>   // To handle the MQTT Client
 #include <WiFi.h>    // To Manage the WiFi 
@@ -21,14 +24,13 @@ TaskHandle_t schedularTask;
 
 DateTime nowClock = rtc.now();
 
-const char*     ssid        = "Epazz2FOffice4-2G";
-const char*     password    = "epazzlahore";
+const char*     ssid        = "YOU SSID";
+const char*     password    = "***";
 const char*     MQTT_broker = "broker.hivemq.com";
 const uint16_t  MQTTport    =  1883;
 const char*     clientID    = "KYTHERTEK123";
 const char*     Topic       = "KytherTek/ledScheduler";
 const char*     txTopic     = "KytherTek/sendScheduler";
-uint64_t startAlarm, stopAlam;
 
 bool startBlinking = false, getSchedule = false, led1State = false, led2State = false;
 
@@ -141,7 +143,7 @@ void EEPROMInit(){
  * @param sched: Taking Value of scheduler to store in EEPROM
  * @returns None
  */
-void updateEEPROM(Scheduler_t &sched){
+void updateEEPROM(Scheduler_t sched){
   if (sched.id > 0 && sched.id <= 5 )
   {  
   uint8_t address = (sched.id-1) * sizeof(Scheduler_t);
@@ -168,6 +170,10 @@ void BlinkLED1(uint8_t rate){
     led1State = false;}
 }
 
+/**
+ * To read the Schedules from EEPROM
+ * 
+ */
 void readScheduleFromEEPROM() {
   int addr = 0;
   for (uint8_t i = 0; i < MAX_SCHEDULES; i++)
@@ -199,7 +205,8 @@ void BlinkLED2(uint8_t rate){
 uint16_t mils=millis();
 
 void setup() {
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable   detector
+
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); //disable burnout detector
   DEBUG.begin(115200);
   pinMode(LED1,OUTPUT);
   pinMode(LED2,OUTPUT);
@@ -229,7 +236,12 @@ void setup() {
 
 }
 
-void sendCurrentStatus(Scheduler_t &Sched)
+/**
+ * To publish the Current Status of Schedule to MQTT
+ * @param Sched : The current schedule that is running
+ * @returns None
+ */
+void sendCurrentStatus(Scheduler_t Sched)
 {
   String data;
   data += "Current Schedule ID: ";
@@ -238,14 +250,19 @@ void sendCurrentStatus(Scheduler_t &Sched)
   data += Sched.led1Rate;
   data += " Led 2 rate : ";
   data += Sched.led2Rate;
-  xQueueSend(xQueue,&data,portMAX_DELAY);
+  xQueueSend(xQueue,data.c_str(),portMAX_DELAY);
 }
 
+/**
+ * Task to be performed on Core 0 of ESP32
+ * @param  void*pvParameters
+ * @returns None
+ */
 void mqttHandeling(void* pvParameters){
   EEPROMInit();
   wifiConnect();
   mqttSetup();
-  String rxData;
+  char rxData[60];
   for(;;){
     mqttclient.loop();
     if (!mqttclient.connected())
@@ -256,10 +273,15 @@ void mqttHandeling(void* pvParameters){
   }
 
   xQueueReceive(xQueue,&rxData,portMAX_DELAY);
-  mqttclient.publish(txTopic,rxData.c_str(),sizeof(rxData));
+  mqttclient.publish(txTopic,rxData,sizeof(rxData));
   vTaskDelay(pdMS_TO_TICKS(10));
 }
 
+/**
+ * Blink scheduling on Core 1 of ESP32
+ * @param  void*pvParameter
+ * @returns None
+ */
 void blinkScheduling(void* pvParameter){
   
   for (;;)
@@ -282,9 +304,10 @@ void blinkScheduling(void* pvParameter){
         }               
       }
       nowClock = rtc.now();
-      i++ > 5 ? i=0:i;
+      i++ >= 5 ? i=0:i;
       
     }
+
     while (startBlinking)
     {
       nowClock = rtc.now();
